@@ -2,13 +2,19 @@
 
 var OpportunityRollup = OpportunityRollup || {};
 
-// True while our code is triggering a programmatic save.
-// Prevents the OnSave handler from firing again on our own save.
+// ── Configuration ────────────────────────────────────────────────────────────
+// Set this to the Name property of your Opportunity Products subgrid control.
+// Find it in the form editor: select the subgrid → Properties → Name field.
+OpportunityRollup.SUBGRID_NAME = "opportunityproducts";
+
+// ── Internal state ────────────────────────────────────────────────────────────
+// True while this script is triggering a programmatic save, so OnSave skips
+// re-running and lets the save through cleanly.
 OpportunityRollup._saving = false;
 
 /**
- * Queries all opportunity product lines for the given opportunity and writes
- * the rolled-up totals back onto the form context.
+ * Queries all opportunity product lines and writes the rolled-up totals back
+ * onto the opportunity form.
  *
  * @param  {object} formContext
  * @param  {string} opportunityId  GUID without curly braces
@@ -76,10 +82,10 @@ OpportunityRollup._computeAndSetTotals = function (formContext, opportunityId) {
 };
 
 /**
- * Triggers a programmatic save, guarded by the _saving flag so OnSave does
- * not fire again recursively.  The flag is always cleared on completion.
+ * Programmatic save guarded by _saving so OnSave does not recurse.
+ * The flag is always cleared whether the save succeeds or fails.
  *
- * @param  {object} formContext
+ * @param {object} formContext
  */
 OpportunityRollup._doSave = function (formContext) {
     OpportunityRollup._saving = true;
@@ -96,24 +102,81 @@ OpportunityRollup._doSave = function (formContext) {
 };
 
 /**
- * OnLoad handler.
- * Computes product-line rollup totals and, if any values changed, saves the
- * record so the Pipeline Tracker view is immediately up-to-date.
+ * Recomputes totals and saves if any field changed.
+ * Shared by the subgrid handler and OnSave follow-up.
  *
- * Register this function on the Opportunity form OnLoad event.
- * Pass execution context: YES.
+ * @param {object} formContext
+ * @param {string} opportunityId  GUID without curly braces
+ */
+OpportunityRollup._refreshAndSave = function (formContext, opportunityId) {
+    OpportunityRollup._computeAndSetTotals(formContext, opportunityId).then(function () {
+        if (formContext.data.getIsDirty()) {
+            OpportunityRollup._doSave(formContext);
+        }
+    });
+};
+
+/**
+ * Registers an OnLoad listener on the Opportunity Products subgrid so that
+ * totals are recalculated automatically whenever a product line is added,
+ * edited, or deleted — without the user having to manually save or refresh.
+ *
+ * The subgrid fires its OnLoad event after every grid refresh, which happens
+ * each time a product record is saved inside the quick-create/edit panel.
+ *
+ * @param {object} formContext
+ * @param {string} opportunityId  GUID without curly braces
+ */
+OpportunityRollup._registerSubgridHandler = function (formContext, opportunityId) {
+    var subgrid = formContext.getControl(OpportunityRollup.SUBGRID_NAME);
+
+    if (!subgrid) {
+        // Subgrid may not have rendered yet; retry once after a short delay
+        window.setTimeout(function () {
+            var retrySubgrid = formContext.getControl(OpportunityRollup.SUBGRID_NAME);
+            if (retrySubgrid) {
+                retrySubgrid.addOnLoad(function () {
+                    OpportunityRollup._refreshAndSave(formContext, opportunityId);
+                });
+            } else {
+                console.warn(
+                    "OpportunityRollup – subgrid '" +
+                    OpportunityRollup.SUBGRID_NAME +
+                    "' not found. Check SUBGRID_NAME matches the control Name in the form editor."
+                );
+            }
+        }, 1500);
+        return;
+    }
+
+    subgrid.addOnLoad(function () {
+        OpportunityRollup._refreshAndSave(formContext, opportunityId);
+    });
+};
+
+/**
+ * OnLoad handler.
+ * • Computes rollup totals from product lines and saves if values changed.
+ * • Hooks the Opportunity Products subgrid so any add/edit/delete instantly
+ *   recalculates and saves totals without user interaction.
+ *
+ * Register on the Opportunity form OnLoad event.
+ * "Pass execution context as first parameter" must be checked.
  *
  * @param {object} executionContext
  */
 OpportunityRollup.onLoad = function (executionContext) {
-    var formContext = executionContext.getFormContext();
+    var formContext  = executionContext.getFormContext();
     var opportunityId = formContext.data.entity.getId();
     if (!opportunityId) { return; }
 
     opportunityId = opportunityId.replace(/[{}]/g, "");
 
+    // Wire up the subgrid listener (runs immediately and on every grid refresh)
+    OpportunityRollup._registerSubgridHandler(formContext, opportunityId);
+
+    // Also compute on form load so the header totals are correct right away
     OpportunityRollup._computeAndSetTotals(formContext, opportunityId).then(function () {
-        // Only save if our writes actually dirtied the form
         if (formContext.data.getIsDirty()) {
             OpportunityRollup._doSave(formContext);
         }
@@ -122,36 +185,35 @@ OpportunityRollup.onLoad = function (executionContext) {
 
 /**
  * OnSave handler.
- * Lets the user's save proceed untouched, then asynchronously recomputes
- * totals and triggers a silent follow-up save so the rolled-up values are
- * always current after any manual save.
+ * Lets the user's save proceed untouched (save button is never blocked), then
+ * fires a follow-up save to persist any freshly computed totals.
  *
- * Save & Close and Save & New are left alone — the next OnLoad handles them.
+ * Save & Close (2) and Save & New (59) are skipped — the next OnLoad handles
+ * recalculation on the newly opened form.
  *
- * Register this function on the Opportunity form OnSave event.
- * Pass execution context: YES.
+ * Register on the Opportunity form OnSave event.
+ * "Pass execution context as first parameter" must be checked.
  *
  * @param {object} executionContext
  */
 OpportunityRollup.onSave = function (executionContext) {
-    // If we triggered this save ourselves, allow it through without re-running
+    // Our own programmatic save — let it through
     if (OpportunityRollup._saving) { return; }
 
-    var formContext = executionContext.getFormContext();
+    var formContext   = executionContext.getFormContext();
     var opportunityId = formContext.data.entity.getId();
     if (!opportunityId) { return; }
 
-    // getSaveMode() values:  1 = Save,  2 = Save & Close,  59 = Save & New
-    // For Save & Close / Save & New let the save proceed normally;
-    // OnLoad on the next form open will recompute.
     var eventArgs = executionContext.getEventArgs();
     var saveMode  = eventArgs ? eventArgs.getSaveMode() : 0;
+
+    // 2 = Save & Close, 59 = Save & New — don't block or follow up
     if (saveMode === 2 || saveMode === 59) { return; }
 
     opportunityId = opportunityId.replace(/[{}]/g, "");
 
-    // Allow the current save to proceed; after async compute, trigger one
-    // more save so the rolled-up values are persisted.
+    // User's save proceeds normally; after async compute a follow-up save
+    // persists the new totals without disabling or intercepting the save button.
     OpportunityRollup._computeAndSetTotals(formContext, opportunityId).then(function () {
         if (formContext.data.getIsDirty()) {
             OpportunityRollup._doSave(formContext);
